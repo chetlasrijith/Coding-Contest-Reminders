@@ -1,0 +1,6 @@
+requests
+python-dateutil
+APScheduler
+pytz
+python-dotenv
+beautifulsoup4
