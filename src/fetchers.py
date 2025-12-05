@@ -54,39 +54,53 @@ def fetch_codechef(upcoming_within_hours=72):
         # Try to find tables with 'Upcoming Contests' or 'Future Contests' heading
         tables = soup.find_all("table")
         for table in tables:
-            # iterate rows
             thead = table.find("thead")
             headers = [th.get_text(strip=True).lower() for th in (thead.find_all("th") if thead else [])]
-            # common header detection
             if not headers:
                 continue
-            # expected header containing 'contest' and 'start' or 'date'
+            # expected header containing 'contest' and some time/date column
             if any("contest" in h for h in headers) and any(("start" in h) or ("date" in h) or ("time" in h) for h in headers):
-                for tr in table.find("tbody").find_all("tr"):
+                tbody = table.find("tbody")
+                if not tbody:
+                    continue
+                for tr in tbody.find_all("tr"):
                     cols = [td.get_text(" ", strip=True) for td in tr.find_all("td")]
                     if not cols:
                         continue
-                    # Typical CodeChef table columns: Code, Contest, Start Date, Duration, End Date, Type
-                    # We attempt to map using known patterns:
-                    # Find title and start column by position heuristics
-                    title = cols[1] if len(cols) > 1 else cols[0]
-                    # start might be cols[2] or cols[1] depending on layout
-                    start_text = cols[2] if len(cols) > 2 else cols[-2]
-                    # try parsing start_text — CodeChef uses format like "2025-12-07 18:30:00"
+                    # prefer an <a> text for title if available
+                    a = tr.find("a", href=True)
+                    title = a.get_text(strip=True) if a else (cols[1] if len(cols) > 1 else cols[0])
+
+                    # try to find a column that looks like a date/time
+                    start_text = None
+                    for c in cols:
+                        if any(ch.isdigit() for ch in c) and (":" in c or any(m in c.lower() for m in ["jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec"])):
+                            start_text = c
+                            break
+                    # fallback to second/third column heuristics
+                    if not start_text:
+                        if len(cols) > 2:
+                            start_text = cols[2]
+                        elif len(cols) > 1:
+                            start_text = cols[1]
+                        else:
+                            start_text = ""
+
+                    # parse the start time robustly
                     try:
-                        # If timezone not present, assume IST
-                        # Try multiple parsing attempts
                         from dateutil import parser
-                        start_dt = parser.parse(start_text)
+                        # try parsing the candidate start_text first
+                        try:
+                            start_dt = parser.parse(start_text, fuzzy=True)
+                        except Exception:
+                            # try parsing the whole row text as a last resort
+                            start_dt = parser.parse(tr.get_text(" ", strip=True), fuzzy=True)
                         if start_dt.tzinfo is None:
-                            # assume IST
+                            # assume IST if timezone missing
                             start_dt = start_dt.replace(tzinfo=tz.gettz("Asia/Kolkata"))
-                        # filter
                         now = datetime.now(timezone.utc)
                         if (start_dt.astimezone(timezone.utc) - now).total_seconds() > upcoming_within_hours*3600:
                             continue
-                        # contest url: may be in <a>
-                        a = tr.find("a", href=True)
                         contest_url = f"https://www.codechef.com{a['href']}" if a and a['href'].startswith("/") else (a['href'] if a else url)
                         out.append({
                             "platform": "CodeChef",
@@ -96,6 +110,7 @@ def fetch_codechef(upcoming_within_hours=72):
                             "duration_seconds": None
                         })
                     except Exception:
+                        # skip rows we can't parse
                         continue
     except Exception as e:
         print("[ERR] fetch_codechef:", e)
@@ -110,100 +125,127 @@ def fetch_leetcode(upcoming_within_hours=72):
     out = []
     try:
         url = "https://leetcode.com/contest/"
+        # LeetCode exposes a simple contest info JSON endpoint; try that first
+        api_url = "https://leetcode.com/contest/api/info/"
+        try:
+            r = requests.get(api_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+            if r.status_code == 200:
+                data = r.json()
+                # look for lists of contests in the response
+                candidates = []
+                if isinstance(data, dict):
+                    for v in data.values():
+                        if isinstance(v, list):
+                            candidates.extend(v)
+                from dateutil import parser
+                now = datetime.now(timezone.utc)
+                for item in candidates:
+                    # item may be a dict with start_time / start / startTime
+                    start_val = None
+                    title = None
+                    url_item = url
+                    if isinstance(item, dict):
+                        # common keys
+                        for k in ("start_time", "startTime", "start", "begin_time", "epoch"): 
+                            if k in item:
+                                start_val = item[k]
+                                break
+                        for k in ("title", "name", "contest_name"): 
+                            if k in item:
+                                title = item[k]
+                                break
+                        if "url" in item:
+                            url_item = item["url"]
+                    # normalize start_val
+                    if start_val is None:
+                        continue
+                    try:
+                        if isinstance(start_val, (int, float)):
+                            # treat as epoch seconds or milliseconds
+                            sv = int(start_val)
+                            if sv > 10**12:
+                                dt = datetime.fromtimestamp(sv/1000, tz=timezone.utc)
+                            else:
+                                dt = datetime.fromtimestamp(sv, tz=timezone.utc)
+                        else:
+                            dt = parser.parse(str(start_val))
+                            if dt.tzinfo is None:
+                                dt = dt.replace(tzinfo=timezone.utc)
+                        if (dt - now).total_seconds() > upcoming_within_hours*3600:
+                            continue
+                        out.append({
+                            "platform": "LeetCode",
+                            "title": title or "LeetCode Contest",
+                            "start_dt": dt,
+                            "url": url_item,
+                            "duration_seconds": None
+                        })
+                    except Exception:
+                        continue
+                # if we got any, return early
+                if out:
+                    return out
+        except Exception:
+            # ignore and fallback to HTML parsing
+            pass
+
+        # fallback: parse the HTML and try to extract ISO timestamps from script tags
         resp = requests.get(url, timeout=15, headers={"User-Agent":"Mozilla/5.0"})
         soup = BeautifulSoup(resp.text, "html.parser")
-
-        # Try to find upcoming contest cards (class names may change)
-        # Look for elements containing "Upcoming" headings and contest rows
-        # Search for elements containing "Upcoming"
-        upcoming_sections = []
-        for tag in soup.find_all(string=lambda t: "Upcoming" in t or "upcoming" in t):
-            # parent's card container
-            parent = tag.find_parent()
-            if parent:
-                upcoming_sections.append(parent)
-
-        # Fallback: find elements with 'upcoming-contests' in id/class
-        if not upcoming_sections:
-            upcoming_sections = soup.select(".upcoming-contests, .contest-card, ._2rJ3_")  # heuristic classes
-
-        # parse from known JSON blob: many LeetCode pages embed window.__INITIAL_STATE__ with data
-        # Look for script tag that contains "contestData" or "window.__INITIAL_STATE__"
         scripts = soup.find_all("script")
         found = False
+        import re
         for s in scripts:
-            txt = s.string
+            txt = s.string or s.text
             if not txt:
                 continue
-            if "upcoming_contests" in txt or "contestData" in txt or "upcoming" in txt.lower():
-                # try to find ISO timestamps in the script
-                import re
-                matches = re.findall(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}.\d+Z", txt)
-                if matches:
-                    from dateutil import parser
-                    for m in set(matches):
-                        try:
-                            dt = parser.isoparse(m)
-                            now = datetime.now(timezone.utc)
-                            if (dt - now).total_seconds() > upcoming_within_hours*3600:
-                                continue
-                            # We don't know title from matches; create a generic title
-                            out.append({
-                                "platform": "LeetCode",
-                                "title": "LeetCode Contest",
-                                "start_dt": dt,
-                                "url": url,
-                                "duration_seconds": None
-                            })
-                        except Exception:
+            # look for ISO timestamps like 2025-12-07T18:30:00Z (with optional fractional seconds)
+            matches = re.findall(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z", txt)
+            if matches:
+                from dateutil import parser
+                now = datetime.now(timezone.utc)
+                for m in set(matches):
+                    try:
+                        dt = parser.isoparse(m)
+                        if (dt - now).total_seconds() > upcoming_within_hours*3600:
                             continue
-                    found = True
-                    break
+                        out.append({
+                            "platform": "LeetCode",
+                            "title": "LeetCode Contest",
+                            "start_dt": dt,
+                            "url": url,
+                            "duration_seconds": None
+                        })
+                    except Exception:
+                        continue
+                found = True
+                break
 
-        # If we didn't find via script, attempt to parse visible contest list (best-effort)
+        # last resort: try to scan visible text for 'Starts' and parse nearby date
         if not found:
-            # Find li or div items that look like contest entries
+            from dateutil import parser
             for item in soup.select("li, div"):
                 text = item.get_text(" ", strip=True)
                 if not text:
                     continue
                 if "Starts" in text or "Starts in" in text or "UTC" in text:
-                    # attempt to extract ISO-like date
-                    from dateutil import parser
-                    import re
-                    # look for patterns like '2025-12-07 18:30' or 'Dec 07, 2025 18:30'
-                    date_match = None
-                    # try to find ISO timestamps
-                    iso = re.search(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", text)
-                    if iso:
-                        date_match = iso.group(0)
-                    else:
-                        # fallback: try to parse whole text (can be noisy)
-                        try:
-                            dt = parser.parse(text, fuzzy=True)
-                            if dt.tzinfo is None:
-                                dt = dt.replace(tzinfo=timezone.utc)
-                            date_match = dt.isoformat()
-                        except Exception:
-                            date_match = None
-                    if date_match:
-                        try:
-                            dt = parser.parse(date_match)
-                            if dt.tzinfo is None:
-                                dt = dt.replace(tzinfo=timezone.utc)
-                            now = datetime.now(timezone.utc)
-                            if (dt - now).total_seconds() > upcoming_within_hours*3600:
-                                continue
-                            title = text.split("\n")[0][:120]
-                            out.append({
-                                "platform": "LeetCode",
-                                "title": title,
-                                "start_dt": dt,
-                                "url": url,
-                                "duration_seconds": None
-                            })
-                        except Exception:
+                    try:
+                        dt = parser.parse(text, fuzzy=True)
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
+                        now = datetime.now(timezone.utc)
+                        if (dt - now).total_seconds() > upcoming_within_hours*3600:
                             continue
+                        title = text.split("\n")[0][:120]
+                        out.append({
+                            "platform": "LeetCode",
+                            "title": title,
+                            "start_dt": dt,
+                            "url": url,
+                            "duration_seconds": None
+                        })
+                    except Exception:
+                        continue
     except Exception as e:
         print("[ERR] fetch_leetcode:", e)
     return out

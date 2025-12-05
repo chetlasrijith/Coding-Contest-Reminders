@@ -74,6 +74,20 @@ def schedule_from_fetcher(scheduler, tz, upcoming_hours=72, default_phone=None):
             start_dt = start_dt.astimezone(tz)
         schedule_event(scheduler, platform, title, start_dt, phone, tz)
 
+def get_default_phone():
+    # prefer explicit env var, fallback to first phone in CSV
+    phone = os.getenv("DEFAULT_PHONE")
+    if phone:
+        return phone
+    try:
+        for r in read_contests(CSV_PATH):
+            p = r.get("phone")
+            if p:
+                return p
+    except Exception:
+        pass
+    return None
+
 def main():
     tz = pytz.timezone(TIMEZONE)
     executors = {'default': ThreadPoolExecutor(10)}
@@ -96,6 +110,29 @@ def main():
 
     # schedule periodic fetch every hour
     scheduler.add_job(lambda: schedule_from_fetcher(scheduler, tz, upcoming_hours=72), 'interval', hours=1, id="fetch_every_hour")
+
+    # Weekly reminders (user-requested):
+    # - LeetCode: every Sunday at 07:55 local time
+    # - CodeChef: every Wednesday at 19:55 local time
+    phone = get_default_phone()
+    if not phone:
+        print("[WARN] No phone configured for weekly reminders (set DEFAULT_PHONE or add phone in contests.csv)")
+    else:
+        def weekly_leetcode():
+            now_pretty = datetime.now(tz).strftime("%Y-%m-%d %H:%M %Z")
+            send_template(phone, "LeetCode: Weekly Reminder", now_pretty)
+
+        def weekly_codechef():
+            now_pretty = datetime.now(tz).strftime("%Y-%m-%d %H:%M %Z")
+            send_template(phone, "CodeChef: Weekly Reminder", now_pretty)
+
+        try:
+            scheduler.add_job(weekly_leetcode, 'cron', day_of_week='sun', hour=7, minute=55, id='weekly_leetcode')
+            scheduler.add_job(weekly_codechef, 'cron', day_of_week='wed', hour=19, minute=55, id='weekly_codechef')
+            print(f"[SCHEDULED] Weekly LeetCode reminders: Sun 07:55 -> {phone}")
+            print(f"[SCHEDULED] Weekly CodeChef reminders: Wed 19:55 -> {phone}")
+        except Exception as e:
+            print("[ERR] scheduling weekly reminders:", e)
 
     try:
         while True:
