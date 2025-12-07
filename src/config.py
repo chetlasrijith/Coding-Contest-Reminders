@@ -9,7 +9,7 @@ PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
 GRAPH_API_VERSION = os.getenv("GRAPH_API_VERSION", "v24.0")
 TEMPLATE_NAME = os.getenv("TEMPLATE_NAME", "contest_notification")
-TEMPLATE_LANG = os.getenv("TEMPLATE_LANG", "en_US")
+TEMPLATE_LANG = os.getenv("TEMPLATE_LANG", "en")
 TIMEZONE = os.getenv("TIMEZONE", "UTC")
 
 API_URL = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{PHONE_NUMBER_ID}/messages"
